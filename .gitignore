@@ -1,0 +1,20 @@
+# 우석님 데이터 패키지와 거기서 만든 학습 데이터 (prepare_data.py로 다시 생성)
+dataset/
+data_full/
+data_slim/
+
+# 학습 결과물 (어댑터는 용량이 커서 드라이브로 공유)
+lora_A/
+lora_B/
+*.zip
+outputs/
+
+# 평가 결과 (정답 문장이 들어 있어 올리지 않음, 숫자는 README에 정리)
+results/
+bench_*.json
+baseline_*.json
+finetuned_*.json
+
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
