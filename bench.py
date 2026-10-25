@@ -19,14 +19,18 @@ import argparse, json, statistics, time, urllib.request
 from pathlib import Path
 
 
-def stream_chat(url, model, messages, max_tokens):
-    """스트리밍으로 요청하고 (ttft, total, prompt_tokens, completion_tokens, text) 반환"""
+def stream_chat(url, model, messages, max_tokens, fixed=False):
+    """스트리밍으로 요청하고 (ttft, total, prompt_tokens, completion_tokens, text) 반환.
+    fixed=True면 끝 토큰이 나와도 max_tokens까지 계속 생성 (출력 길이를 맞춰 방식끼리 공정하게 비교)"""
     body = {
         "model": model, "messages": messages, "max_tokens": max_tokens,
         "temperature": 0, "stream": True,
         "stream_options": {"include_usage": True},
         "chat_template_kwargs": {"enable_thinking": False},   # Qwen3 생각 모드 끔
     }
+    if fixed:
+        body["ignore_eos"] = True        # vLLM 전용 옵션
+        body["min_tokens"] = max_tokens
     req = urllib.request.Request(url + "/v1/chat/completions",
                                  data=json.dumps(body).encode("utf-8"),
                                  headers={"Content-Type": "application/json"})
@@ -70,35 +74,49 @@ def main():
     ap.add_argument("--base", default="Qwen/Qwen3-1.7B", help="vLLM --model 이름")
     ap.add_argument("--data", default="data_slim")
     ap.add_argument("--runs", type=int, default=3, help="각 프롬프트 반복 횟수")
-    ap.add_argument("--only", choices=["base", "lora"], help="base=원본만, lora=어댑터만")
+    ap.add_argument("--only", choices=["base", "lora", "a", "b"],
+                    help="base=원본만, lora=A·B만, a=A만, b=B만 (병합 모델을 하나씩 띄울 때)")
+    ap.add_argument("--a-file", help="A 프롬프트 jsonl (기본: {data}/A_eval.jsonl)")
+    ap.add_argument("--b-file", help="B 프롬프트 jsonl (기본: {data}/B_eval.jsonl)")
+    ap.add_argument("--model-a", default="lora_A", help="A 요청에 쓸 모델 이름 (병합 모델이면 그 served 이름)")
+    ap.add_argument("--model-b", default="lora_B", help="B 요청에 쓸 모델 이름")
     ap.add_argument("--max-a", type=int, default=512)
     ap.add_argument("--max-b", type=int, default=128)
+    ap.add_argument("--fixed-a", type=int, default=0, help="A 출력 길이를 이 토큰 수로 고정 (0=끔)")
+    ap.add_argument("--fixed-b", type=int, default=0, help="B 출력 길이를 이 토큰 수로 고정 (0=끔). 원본·덜 학습된 모델도 같은 길이로 비교")
     ap.add_argument("--save", help="결과 JSON 저장 경로")
     args = ap.parse_args()
+    if args.fixed_a: args.max_a = args.fixed_a
+    if args.fixed_b: args.max_b = args.fixed_b
 
-    A = load(f"{args.data}/A_eval.jsonl")
-    B = load(f"{args.data}/B_eval.jsonl")
+    A = load(args.a_file or f"{args.data}/A_eval.jsonl")
+    B = load(args.b_file or f"{args.data}/B_eval.jsonl")
+    for r in A + B:                       # 팀장님 데이터는 id 대신 scenario_id
+        r.setdefault("id", r.get("scenario_id", "?"))
 
     # (이름, 모델, 데이터, max_tokens)
-    targets = []
-    if args.only != "base":
-        targets += [("LoRA-A", "lora_A", A, args.max_a), ("LoRA-B", "lora_B", B, args.max_b)]
-    if args.only != "lora":
-        targets += [("원본(B 프롬프트)", args.base, B, args.max_b)]
+    targets = []   # (이름, 모델, 데이터, max_tokens, 길이 고정 여부)
+    if args.only in (None, "lora", "a"):
+        targets.append(("LoRA-A", args.model_a, A, args.max_a, bool(args.fixed_a)))
+    if args.only in (None, "lora", "b"):
+        targets.append(("LoRA-B", args.model_b, B, args.max_b, bool(args.fixed_b)))
+    if args.only in (None, "base"):
+        targets += [("원본(B 프롬프트)", args.base, B, args.max_b, bool(args.fixed_b))]
 
     # 예열: 첫 호출은 느리므로 측정에서 뺀다
-    for name, model, rows, _ in targets:
+    for name, model, rows, _, _ in targets:
         stream_chat(args.url, model, rows[0]["messages"][:-1], 16)
-    print(f"예열 완료. {len(A)}건 × {args.runs}회 측정 시작 ({args.data})\n")
+    n = min(len(rows) for _, _, rows, _, _ in targets)
+    print(f"예열 완료. {n}건 × {args.runs}회 측정 시작\n")
 
     results = {name: [] for name, *_ in targets}
     json_ok = {"ok": 0, "all": 0}
-    for i in range(len(B)):
-        line = [A[i]["id"] if i < len(A) else B[i]["id"]]
-        for name, model, rows, max_tok in targets:
+    for i in range(n):
+        line = [targets[0][2][i]["id"]]
+        for name, model, rows, max_tok, fixed in targets:
             msgs = rows[i]["messages"][:-1]
             for _ in range(args.runs):
-                ttft, total, pt, ct, text = stream_chat(args.url, model, msgs, max_tok)
+                ttft, total, pt, ct, text = stream_chat(args.url, model, msgs, max_tok, fixed)
                 results[name].append({"id": rows[i]["id"], "ttft": ttft, "total": total,
                                       "prompt_tokens": pt, "completion_tokens": ct, "text": text})
             if name == "LoRA-A":   # A 출력이 JSON으로 읽히는지도 확인 (마지막 반복 기준)
